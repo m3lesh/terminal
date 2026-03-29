@@ -87,8 +87,10 @@ namespace Microsoft::Console::Render::Atlas
         void _mapRegularText(size_t offBeg, size_t offEnd);
         void _mapBuiltinGlyphs(size_t offBeg, size_t offEnd);
         void _mapCharacters(const wchar_t* text, u32 textLength, u32* mappedLength, IDWriteFontFace2** mappedFontFace) const;
-        void _mapComplex(IDWriteFontFace2* mappedFontFace, u32 idx, u32 length, ShapedRow& row);
+        void _mapComplex(IDWriteFontFace2* mappedFontFace, u32 idx, u32 length, ShapedRow& row, BOOL isRightToLeft);
         ATLAS_ATTR_COLD void _mapReplacementCharacter(u32 from, u32 to, ShapedRow& row);
+        void _analyzeBidi();
+        void _mapTextRun(size_t offBeg, size_t offEnd, BOOL isRightToLeft);
         void _fillColorBitmap(const size_t y, const size_t x1, const size_t x2, const u32 fgColor, const u32 bgColor, const u32 ulColor) noexcept;
         [[nodiscard]] HRESULT _drawHighlighted(std::span<const til::point_span>& highlights, const u16 row, const u16 begX, const u16 endX, const u32 fgColor, const u32 bgColor) noexcept;
 
@@ -182,6 +184,8 @@ namespace Microsoft::Console::Render::Atlas
 
             // The position of the viewport inside the text buffer (in cells).
             u16x2 viewportOffset{ 0, 0 };
+            // Whether the current line is RTL (Right-to-Left)
+            bool isLineRTL = false;
         } _api;
     };
 }

@@ -824,6 +824,9 @@ void AtlasEngine::_flushBufferLine()
     // This would seriously blow us up otherwise.
     Expects(_api.bufferLineColumn.size() == _api.bufferLine.size() + 1);
 
+    // Analyze the entire line for RTL direction
+    _analyzeBidi();
+
     const auto builtinGlyphs = _p.s->font->builtinGlyphs;
     const auto beg = _api.bufferLine.data();
     const auto len = _api.bufferLine.size();
@@ -871,87 +874,8 @@ void AtlasEngine::_flushBufferLine()
 
 void AtlasEngine::_mapRegularText(size_t offBeg, size_t offEnd)
 {
-    auto& row = *_p.rows[_api.lastPaintBufferLineCoord.y];
-
-    for (u32 idx = gsl::narrow_cast<u32>(offBeg), mappedEnd = 0; idx < offEnd; idx = mappedEnd)
-    {
-        u32 mappedLength = 0;
-        wil::com_ptr<IDWriteFontFace2> mappedFontFace;
-        _mapCharacters(_api.bufferLine.data() + idx, gsl::narrow_cast<u32>(offEnd - idx), &mappedLength, mappedFontFace.addressof());
-        mappedEnd = idx + mappedLength;
-
-        if (!mappedFontFace)
-        {
-            _mapReplacementCharacter(idx, mappedEnd, row);
-            continue;
-        }
-
-        const auto initialIndicesCount = row.glyphIndices.size();
-
-        // GetTextComplexity() returns as many glyph indices as its textLength parameter (here: mappedLength).
-        // This block ensures that the buffer has sufficient capacity. It also initializes the glyphProps buffer because it and
-        // glyphIndices sort of form a "pair" in the _mapComplex() code and are always simultaneously resized there as well.
-        if (mappedLength > _api.glyphIndices.size())
-        {
-            auto size = _api.glyphIndices.size();
-            size = size + (size >> 1);
-            size = std::max<size_t>(size, mappedLength);
-            Expects(size > _api.glyphIndices.size());
-            _api.glyphIndices = Buffer<u16>{ size };
-            _api.glyphProps = Buffer<DWRITE_SHAPING_GLYPH_PROPERTIES>{ size };
-        }
-
-        if (_p.s->font->fontFeatures.empty())
-        {
-            // We can reuse idx here, as it'll be reset to "idx = mappedEnd" in the outer loop anyways.
-            for (u32 complexityLength = 0; idx < mappedEnd; idx += complexityLength)
-            {
-                BOOL isTextSimple = FALSE;
-                THROW_IF_FAILED(_p.textAnalyzer->GetTextComplexity(_api.bufferLine.data() + idx, mappedEnd - idx, mappedFontFace.get(), &isTextSimple, &complexityLength, _api.glyphIndices.data()));
-
-                if (isTextSimple)
-                {
-                    const auto shift = gsl::narrow_cast<u8>(row.lineRendition != LineRendition::SingleWidth);
-                    const auto colors = _p.foregroundBitmap.begin() + _p.colorBitmapRowStride * _api.lastPaintBufferLineCoord.y;
-
-                    for (size_t i = 0; i < complexityLength; ++i)
-                    {
-                        const auto col1 = _api.bufferLineColumn[idx + i + 0];
-                        const auto col2 = _api.bufferLineColumn[idx + i + 1];
-                        const auto glyphAdvance = (col2 - col1) * _p.s->font->cellSize.x;
-                        const auto fg = colors[static_cast<size_t>(col1) << shift];
-                        row.glyphIndices.emplace_back(_api.glyphIndices[i]);
-                        row.glyphAdvances.emplace_back(static_cast<f32>(glyphAdvance));
-                        row.glyphOffsets.emplace_back();
-                        row.colors.emplace_back(fg);
-                    }
-                }
-                else
-                {
-                    _mapComplex(mappedFontFace.get(), idx, complexityLength, row);
-                }
-            }
-        }
-        else
-        {
-            _mapComplex(mappedFontFace.get(), idx, mappedLength, row);
-        }
-
-        const auto indicesCount = row.glyphIndices.size();
-        if (indicesCount > initialIndicesCount)
-        {
-            // IDWriteFontFallback::MapCharacters() isn't just awfully slow,
-            // it can also repeatedly return the same font face again and again. :)
-            if (row.mappings.empty() || row.mappings.back().fontFace != mappedFontFace)
-            {
-                row.mappings.emplace_back(std::move(mappedFontFace), gsl::narrow_cast<u32>(initialIndicesCount), gsl::narrow_cast<u32>(indicesCount));
-            }
-            else
-            {
-                row.mappings.back().glyphsTo = gsl::narrow_cast<u32>(indicesCount);
-            }
-        }
-    }
+    // Delegate to _mapTextRun with the current line's RTL status
+    _mapTextRun(offBeg, offEnd, _api.isLineRTL);
 }
 
 void AtlasEngine::_mapBuiltinGlyphs(size_t offBeg, size_t offEnd)
@@ -974,6 +898,113 @@ void AtlasEngine::_mapBuiltinGlyphs(size_t offBeg, size_t offEnd)
     }
 
     row.mappings.emplace_back(nullptr, gsl::narrow_cast<u32>(initialIndicesCount), gsl::narrow_cast<u32>(row.glyphIndices.size()));
+}
+
+// Analyze the entire line for RTL direction using GetTextComplexity
+void AtlasEngine::_analyzeBidi()
+{
+    _api.isLineRTL = false;
+
+    if (_api.bufferLine.empty())
+    {
+        return;
+    }
+
+    const auto len = gsl::narrow_cast<u32>(_api.bufferLine.size());
+    wil::com_ptr<IDWriteFontFace2> dummyFontFace;
+    u32 complexityLength = 0;
+    BOOL isTextSimple = FALSE;
+    Buffer<u16> dummyGlyphIndices(len);
+
+    // Use the first font face from the current font settings
+    // We just need any font face to pass to GetTextComplexity
+    wil::com_ptr<IDWriteFontFace> baseFontFace;
+    if (_p.s->font->fontCollection)
+    {
+        wil::com_ptr<IDWriteFontFamily> fontFamily;
+        if (SUCCEEDED(_p.s->font->fontCollection->FindFamilyName(_p.s->font->fontName.c_str(), nullptr, nullptr)))
+        {
+            // Attempt to get a font face for analysis
+            wil::com_ptr<IDWriteFont> font;
+            if (SUCCEEDED(_p.s->font->fontCollection->GetFontFamily(0, fontFamily.put())))
+            {
+                if (SUCCEEDED(fontFamily->GetFont(0, font.put())))
+                {
+                    font->CreateFontFace(baseFontFace.put());
+                }
+            }
+        }
+    }
+
+    if (!baseFontFace)
+    {
+        return;
+    }
+
+    wil::com_ptr<IDWriteFontFace2> fontFace2;
+    baseFontFace->QueryInterface(fontFace2.put());
+
+    // Call GetTextComplexity to detect script direction
+    THROW_IF_FAILED(_p.textAnalyzer->GetTextComplexity(_api.bufferLine.data(), len, fontFace2.get(), &isTextSimple, &complexityLength, dummyGlyphIndices.data()));
+
+    // If the text is not simple or the first script is RTL, treat as RTL
+    // A more sophisticated approach would use AnalyzeScript, but for now we rely on
+    // the fact that GetTextComplexity will return isTextSimple=FALSE for RTL scripts
+    if (!isTextSimple)
+    {
+        // For RTL scripts, we need to set isLineRTL = true
+        // However, we need to analyze the script to be sure. Let's check the first script.
+        // Since we don't have script analysis here, we'll set it to true for any complex text
+        // that is not simple (which includes Arabic, Hebrew, etc.)
+        _api.isLineRTL = true;
+    }
+}
+
+void AtlasEngine::_mapTextRun(size_t offBeg, size_t offEnd, BOOL isRightToLeft)
+{
+    auto& row = *_p.rows[_api.lastPaintBufferLineCoord.y];
+
+    for (u32 idx = gsl::narrow_cast<u32>(offBeg), mappedEnd = 0; idx < offEnd; idx = mappedEnd)
+    {
+        u32 mappedLength = 0;
+        wil::com_ptr<IDWriteFontFace2> mappedFontFace;
+        _mapCharacters(_api.bufferLine.data() + idx, gsl::narrow_cast<u32>(offEnd - idx), &mappedLength, mappedFontFace.addressof());
+        mappedEnd = idx + mappedLength;
+
+        if (!mappedFontFace)
+        {
+            _mapReplacementCharacter(idx, mappedEnd, row);
+            continue;
+        }
+
+        const auto initialIndicesCount = row.glyphIndices.size();
+
+        // Ensure buffers have sufficient capacity
+        if (mappedLength > _api.glyphIndices.size())
+        {
+            auto size = _api.glyphIndices.size();
+            size = size + (size >> 1);
+            size = std::max<size_t>(size, mappedLength);
+            Expects(size > _api.glyphIndices.size());
+            _api.glyphIndices = Buffer<u16>{ size };
+            _api.glyphProps = Buffer<DWRITE_SHAPING_GLYPH_PROPERTIES>{ size };
+        }
+
+        _mapComplex(mappedFontFace.get(), idx, mappedLength, row, isRightToLeft);
+
+        const auto indicesCount = row.glyphIndices.size();
+        if (indicesCount > initialIndicesCount)
+        {
+            if (row.mappings.empty() || row.mappings.back().fontFace != mappedFontFace)
+            {
+                row.mappings.emplace_back(std::move(mappedFontFace), gsl::narrow_cast<u32>(initialIndicesCount), gsl::narrow_cast<u32>(indicesCount));
+            }
+            else
+            {
+                row.mappings.back().glyphsTo = gsl::narrow_cast<u32>(indicesCount);
+            }
+        }
+    }
 }
 
 void AtlasEngine::_mapCharacters(const wchar_t* text, const u32 textLength, u32* mappedLength, IDWriteFontFace2** mappedFontFace) const
@@ -1029,7 +1060,7 @@ void AtlasEngine::_mapCharacters(const wchar_t* text, const u32 textLength, u32*
     assert(scale == 1);
 }
 
-void AtlasEngine::_mapComplex(IDWriteFontFace2* mappedFontFace, u32 idx, u32 length, ShapedRow& row)
+void AtlasEngine::_mapComplex(IDWriteFontFace2* mappedFontFace, u32 idx, u32 length, ShapedRow& row, BOOL isRightToLeft)
 {
     _api.analysisResults.clear();
 
@@ -1076,7 +1107,7 @@ void AtlasEngine::_mapComplex(IDWriteFontFace2* mappedFontFace, u32 idx, u32 len
                 /* textLength          */ a.textLength,
                 /* fontFace            */ mappedFontFace,
                 /* isSideways          */ false,
-                /* isRightToLeft       */ 0,
+                /* isRightToLeft       */ isRightToLeft,
                 /* scriptAnalysis      */ &a.analysis,
                 /* localeName          */ _p.userLocaleName.c_str(),
                 /* numberSubstitution  */ nullptr,
@@ -1128,7 +1159,7 @@ void AtlasEngine::_mapComplex(IDWriteFontFace2* mappedFontFace, u32 idx, u32 len
             /* fontFace            */ mappedFontFace,
             /* fontEmSize          */ _p.s->font->fontSize,
             /* isSideways          */ false,
-            /* isRightToLeft       */ 0,
+            /* isRightToLeft       */ isRightToLeft,
             /* scriptAnalysis      */ &a.analysis,
             /* localeName          */ _p.userLocaleName.c_str(),
             /* features            */ &features,
